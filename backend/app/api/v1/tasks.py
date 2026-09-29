@@ -6,14 +6,14 @@ from app.database.database import get_db
 from app.models.task import Task
 from app.models.user import User
 from app.schemas.task import TaskCreate, TaskResponse, TaskUpdate
-from app.services.ai_service import generate_ai_response
+from app.services.openclaw_service import run_openclaw_agent, OpenClawError
 
 
 router = APIRouter(prefix="/api/tasks", tags=["Tasks"])
 
 
 def execute_task(task_id: int):
-    """Execute an AI research task in the background."""
+    """Execute a task through the local OpenClaw agent."""
     db_generator = get_db()
     db = next(db_generator)
 
@@ -29,34 +29,40 @@ def execute_task(task_id: int):
         db.commit()
 
         prompt = (
+            "You are the task-execution agent for QuickTodo.\n\n"
+            "Complete the user's task below. Use available tools when useful. "
+            "Be clear about what you completed, distinguish verified facts from "
+            "assumptions, and do not invent sources or claim actions you did not perform.\n\n"
             f"Task: {task.title}\n\n"
-            f"Description: {task.description or 'No additional description'}\n\n"
-            "Complete this task and provide a clear, useful result. "
-            "Use the supplied research sources where relevant. "
-            "Do not invent facts or citations."
+            f"Description: {task.description or 'No additional description'}"
         )
 
-        ai_result = generate_ai_response(prompt)
+        agent_result = run_openclaw_agent(prompt)
 
-        task.sources = ai_result.get("sources", [])
+        task.status = "Completed"
+        task.progress = 100
+        task.result = agent_result["response"]
+        task.error_message = None
+        task.is_completed = True
 
-        if ai_result.get("success"):
-            task.status = "Completed"
-            task.progress = 100
-            task.result = ai_result.get("response")
-            task.error_message = None
-            task.is_completed = True
-        else:
+        # OpenClaw response metadata is not a research-source list.
+        # Keep sources empty until source extraction is implemented.
+        task.sources = []
+
+        db.commit()
+
+    except OpenClawError as exc:
+        db.rollback()
+
+        task = db.query(Task).filter(Task.id == task_id).first()
+
+        if task is not None:
             task.status = "Failed"
             task.progress = 100
             task.result = None
-            task.error_message = ai_result.get(
-                "error",
-                "The AI task could not be completed.",
-            )
+            task.error_message = str(exc)
             task.is_completed = False
-
-        db.commit()
+            db.commit()
 
     except Exception as exc:
         db.rollback()
@@ -67,7 +73,7 @@ def execute_task(task_id: int):
             task.status = "Failed"
             task.progress = 100
             task.result = None
-            task.error_message = str(exc)
+            task.error_message = f"Unexpected task execution error: {exc}"
             task.is_completed = False
             db.commit()
 
